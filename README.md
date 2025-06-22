@@ -1,0 +1,1 @@
+# ping-scanner-go
