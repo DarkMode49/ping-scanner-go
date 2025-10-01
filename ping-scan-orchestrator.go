@@ -1,21 +1,33 @@
 package main
 
-import "sync"
+import (
+	"io"
+	"sync"
+
+	"github.com/cihub/seelog"
+)
 
 // --- 3. The Scan Orchestrator ---
 // This component brings everything together.
 
 type PingScanOrchestrator struct {
 	pinger Pinger
-	writer IPWriter
+	reader FLSFileReader
+	writer IPOutput
+	errorTolerance int
+
+	successfulCount int64
+	failCount int64
 }
 
 // NewPingScanOrchestrator is a factory function that creates
 // new orchestrator with its dependencies
-func NewPingScanOrchestrator(pinger Pinger, writer IPWriter) *PingScanOrchestrator {
+func NewPingScanOrchestrator(pinger Pinger, writer IPOutput, reader FLSFileReader, errorTolerance int) *PingScanOrchestrator {
 	return &PingScanOrchestrator{
 		pinger: pinger,
 		writer: writer,
+		reader: reader,
+		errorTolerance: errorTolerance,
 	}
 }
 
@@ -28,7 +40,6 @@ func (o *PingScanOrchestrator) ProcessIPs(count int, outputFile string) {
 	// from concurrent goroutines
 	responsiveIPsChan := make(chan string, count)
 
-	//TODO int64 version
 	var ipsParts [][]int
 	if threads > 1 {
 		ipsParts = divisionBoundaries(count, threads)
@@ -36,52 +47,69 @@ func (o *PingScanOrchestrator) ProcessIPs(count int, outputFile string) {
 		ipsParts = [][]int{{0, count - 1}}
 	}
 
+	o.successfulCount = 0
+	o.failCount = 0
 	for threadIndex := range threads {
 		wg.Add(1)
 
 		go o.scanner(threadIndex, ipsParts, responsiveIPsChan, &wg)
 	}
+
+	go o.OutputWriter(responsiveIPsChan)
 	
 	wg.Wait()
 	close(responsiveIPsChan)
+}
 
-	//TODO Rewrite this as a concurrent writing thread
-	// Collect all results from the channel into a slice
-	var successfulIPs []string
-	for ip := range responsiveIPsChan {
-		successfulIPs = append(successfulIPs, ip)
-	}
-
-	if len(successfulIPs) > 0 {
-		outputWriteError := o.writer.WriteIPs(outputFile, successfulIPs)
-
-		if outputWriteError != nil {
-			logFatal("Error writing responsive IPs: %v", outputWriteError)
+func (o *PingScanOrchestrator) OutputWriter(responsiveIPsChan chan string) {
+	// The reachable IP is immediately written
+	// into the output file
+	var (
+		outputFileIsOpen bool = false
+		outputFileIO io.ReadWriteCloser
+		outputFileError error
+		writingBuffer WriterFlusher
+	)
+	
+	if !outputFileIsOpen {
+		outputFileIO, outputFileError = o.writer.Open(outputFile)
+	
+		if outputFileError != nil && !silent {
+			seelog.Criticalf(
+				"Output write operation failed! Could not write responsive IPs to the output! More: %v",
+				outputFileError,
+			)
 		}
-		logMsg(
-			"Wrote %d responsive IP addresses to %s",
-			len(successfulIPs),
-			outputFile,
-		)
-	} else {
-		logMsg("No response from any IP")
+		writingBuffer = o.writer.GetBuffer(outputFileIO)
+	}
+	for ip := range responsiveIPsChan {
+		outputWriteError := o.writer.WriteIP(writingBuffer, ip)
+	
+		if outputWriteError != nil && !silent {
+			seelog.Criticalf(
+				"Output write operation failed! Could not write responsive IPs to the output! More: %v",
+				outputWriteError,
+			)
+		}
 	}
 }
 
 func (o *PingScanOrchestrator) scanner(threadIndex int, ipsParts [][]int, responsiveIPsChan chan string, wg *sync.WaitGroup) {
-	//TODO Repalce with interface to decouple
-	//TODO and avoid implementation dependency
-	reader := &FileIPReader{}
-
-	inputIPFile, inputIPFileError := reader.Open(inputFile)
+	inputIPFile, inputIPFileError := o.reader.Open(inputFile)
 
 	if inputIPFileError != nil {
-		logFatal(
-			"Thread %d: Unable to open input file! More: %s",
-			threadIndex,
-			inputIPFileError,
-		)
-		return
+		if !silent {
+			seelog.Criticalf(
+				"Thread %d: Unable to open input file! More: %s",
+				threadIndex,
+				inputIPFileError,
+			)
+		}
+		if o.errorTolerance == 0 {
+			return
+		} else if o.errorTolerance > 0 {
+			o.errorTolerance--
+		}
 	}
 	defer inputIPFile.Close()
 	
@@ -89,32 +117,66 @@ func (o *PingScanOrchestrator) scanner(threadIndex int, ipsParts [][]int, respon
 
 	var readIPErrors byte = 0
 	for lineIndex := ipsParts[threadIndex][0]; lineIndex <= ipsParts[threadIndex][1]; lineIndex++ {
-		ipAddr, ipAddrReadError := reader.ReadIP(
+		ipAddr, ipAddrReadError := o.reader.ReadIP(
 			int64(lineIndex),
 		)
 
 		if ipAddrReadError != nil {
-			logMsg(
-				"Error: Read line operation failure at line %d! More: %s",
-				lineIndex,
-				ipAddrReadError,
-			)
+			if !silent {
+				seelog.Errorf(
+					"Read line operation failure at line %d! More: %s",
+					lineIndex,
+					ipAddrReadError,
+				)
+			}
 			readIPErrors++
 
 			if readIPErrors >= ReadIPErrorMaxThreshold {
-				return
+				if o.errorTolerance == 0 {
+					return
+				} else if o.errorTolerance > 0 {
+					o.errorTolerance--
+				}
 			}
 			continue
 		}
 
-		logMsg("Pinging %s", ipAddr)
+		if !silent {
+			seelog.Infof("Pinging %s", ipAddr)
+		}
 
-		//TODO IPv6 support
-		if o.pinger.Ping(ipAddr) {
-			logMsg("SUCCESS: %s", ipAddr)
+		pingResult, pingError := o.pinger.Ping(ipAddr)
+
+		if pingError != nil {
+			if !silent {
+				seelog.Errorf("[Thread %d] %v", threadIndex, pingError)
+			}
+			if o.errorTolerance == 0 {
+				return
+			} else if o.errorTolerance > 0 {
+				o.errorTolerance--
+			}
+		}
+
+		if pingResult.Bytes > 0 {
+			if !silent {
+				seelog.Infof(
+					"[Thread %d] %d bytes from %s icmp_seq=%d time=%v",
+					threadIndex,
+					pingResult.Bytes,
+					pingResult.IPAddr,
+					pingResult.Sequence,
+					pingResult.Latency,
+				)
+			}
 			responsiveIPsChan <- ipAddr
+
+			o.successfulCount++
+
 		} else {
-			logMsg("FAILURE: %s", ipAddr)
+			seelog.Infof("[Thread %d] No response from %s", threadIndex, ipAddr)
+
+			o.failCount++
 		}
 	}
 }

@@ -3,31 +3,36 @@ package main
 import (
 	"time"
 
-	"github.com/prometheus-community/pro-bing"
+	"github.com/go-ping/ping"
 )
 
 type SystemPinger struct {
 	Timeout time.Duration
 }
 
-func (p *SystemPinger) Ping(ipAddress string) bool {
-	pinger, pingerError := probing.NewPinger(ipAddress)
+func (p *SystemPinger) Ping(ipAddress string) (PingResult, error) {
+	pingResult := PingResult{}
+	
+	pinger, pingerError := ping.NewPinger(ipAddress)
 	if pingerError != nil {
-		logMsg("%v", pingerError)
+		return PingResult{}, pingerError 
 	}
 	pinger.Count = 1
 	pinger.Timeout = p.Timeout
 	pinger.SetPrivileged(true) //? Super-user requirement
 
-	pinger.OnRecv = func(pkt *probing.Packet) {
-		logMsg("%d bytes from %s: icmp_seq=%d time=%v",
-			pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt)
+	pinger.OnRecv = func(pkt *ping.Packet) {
+		pingResult.Bytes = pkt.Nbytes
+		pingResult.IPAddr = pkt.IPAddr
+		pingResult.Sequence = pkt.Seq
+		pingResult.Latency = pkt.Rtt
 	}
 
 	pingerError = pinger.Run()
+	
 	if pingerError != nil {
-		logMsg("%v", pingerError)
+		return PingResult{}, pingerError
 	}
 
-	return pinger.PacketsRecv > 0
+	return pingResult, nil
 }

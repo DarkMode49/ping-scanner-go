@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-func divisionBoundaries(length int, parts int) [][]int {
+func divisionBoundaries(length, parts int) [][]int {
 	if parts <= 0 || length <= 0 {
 		return [][]int{}
 	}
@@ -24,12 +24,13 @@ func divisionBoundaries(length int, parts int) [][]int {
 	return offsets
 }
 
+var lineSep = []byte{'\n'}
+
 func countLines(file *os.File) (int, error) {
 	// Create a buffer to read chunks of the file into
 	// 32KB is a good default size
 	chunkBuffer := make([]byte, 32*1024)
 	lineCount := 0
-	lineSep := []byte{'\n'}
 
 	for {
 		// Read a chunk of the file
@@ -37,7 +38,8 @@ func countLines(file *os.File) (int, error) {
 
 		if readError == io.EOF {
 			break
-		} else if readError != nil {
+		}
+		if readError != nil {
 			return lineCount, readError
 		}
 

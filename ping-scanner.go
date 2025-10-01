@@ -3,31 +3,57 @@ package main
 import (
 	"errors"
 	"io"
-	"log"
+	"net"
 	"os"
 	"time"
 
+	"github.com/cihub/seelog"
 	flag "github.com/spf13/pflag"
+	"github.com/stoicperlman/fls"
 )
 
-const version = "0.2.0"
+const VERSION = "1.0.0"
 var inputFile = "ips.txt"
 var outputFile = "good.txt"
 var threads int = 1
+var errorTolerance int = 2
 var silent bool = false
 const pingTimeout = 2 * time.Second
 
 
+type PingResult struct {
+	Bytes int
+	IPAddr *net.IPAddr
+	Sequence int
+	Latency time.Duration
+}
+
 type IPReader interface {
-	ReadIP() (string, error)
+	ReadIP(line int64) (string, error)
+}
+
+type FLSFileReader interface {
+	Open(filePath string) (*fls.File, error)
+	IPReader
 }
 
 type IPWriter interface {
-	WriteIPs(filePath string, ips []string) error
+	WriteIP(writer WriterFlusher, ip string) error
+}
+
+type IPOutput interface {
+	Open(filePath string) (io.ReadWriteCloser, error)
+	GetBuffer(file io.ReadWriteCloser) (WriterFlusher)
+	IPWriter
+}
+
+type WriterFlusher interface {
+	io.Writer
+    Flush() error
 }
 
 type Pinger interface {
-	Ping(ipAddress string) bool
+	Ping(ipAddress string) (PingResult, error)
 }
 
 
@@ -53,6 +79,13 @@ func arguments() {
 		threads,
 		"Number of concurrent threads (default: 1, recommended: number of CPU cores)",
 	)
+	flag.IntVarP(
+		&threads,
+		"max-errors",
+		"e",
+		threads,
+		"Number of errors to be ignored (default: 3, -1 for no exit)",
+	)
 	flag.BoolVarP(
 		&silent,
 		"silent",
@@ -63,49 +96,55 @@ func arguments() {
 	flag.Parse()
 	
 	if threads < 1 {
-		logMsg("Invalid thread count less than 1!")
+		seelog.Error("Invalid thread count less than 1!")
 		os.Exit(1)
 	}
 	
 	if inputFile == "" {
-		logMsg("Invalid input file parameter!")
+		seelog.Error("Invalid input file parameter!")
 		os.Exit(1)
 	}
 	
 	if outputFile == "" {
-		logMsg("Invalid output file parameter!")
+		seelog.Error("Invalid output file parameter!")
 		os.Exit(1)
 	}
 }
 
-//TODO Improve logging by adding proper level
 func main() {
-	log.SetFlags(0)
-	log.SetOutput(io.Discard)
-
-	logMsg("Ping Scanner v%s", version)
-
 	arguments()
+
+	loggerInterface, _ := seelog.LoggerFromConfigAsString(seelogConsoleConfig)
+	seelog.ReplaceLogger(loggerInterface)
+
+	if !silent {
+		seelog.Infof("Ping Scanner v%s", VERSION)
+	}
 
 	inputFileStats, ipsFileError := os.Stat(inputFile)
 
 	if errors.Is(ipsFileError, os.ErrNotExist) {
-		logMsg("No \"%s\" file was found!", inputFile)
+		if !silent {
+			seelog.Errorf("No \"%s\" file was found!", inputFile)
+		}
 		os.Exit(1)
 	}
 
 	if inputFileStats.Size() < 8 {
 		// 8 bytes is least the file can be having for example:
 		// 0.0.0.0
-		logMsg("Input file \"%s\" is empty or invalid!", inputFile)
+		if !silent {
+			seelog.Errorf("Input file \"%s\" is empty or invalid!", inputFile)
+		}
 		os.Exit(1)
 	}
 
-	// Dependency Injection
 	inputIPFile, inputIPFileError := os.Open(inputFile)
 	
 	if inputIPFileError != nil {
-		logFatal("Unable to open input file! More: %s", inputIPFileError)
+		if !silent {
+			seelog.Criticalf("Unable to open input file! More: %s", inputIPFileError)
+		}
 		os.Exit(1)
 	}
 	defer inputIPFile.Close()
@@ -113,15 +152,29 @@ func main() {
 	ipCount, ipCountError := countLines(inputIPFile)
 
 	if ipCountError != nil {
-		logFatal("Error: Input file loading failure! More: %s", ipCountError)
-		os.Exit(1)
+		if !silent {
+			seelog.Criticalf("Input file loading failure! More: %s", ipCountError)
+		}
+		return
 	}
 
 	pinger := &SystemPinger{Timeout: pingTimeout}
 	writer := &FileIPWriter{}
+	reader := &FileIPReader{}
 
-	orchestrator := NewPingScanOrchestrator(pinger, writer)
+	orchestrator := NewPingScanOrchestrator(pinger, writer, reader, errorTolerance)
 
-	logMsg("Starting ICMP ping scan...")
+	if !silent {
+		seelog.Warnf("Starting ICMP ping scan...")
+	}
 	orchestrator.ProcessIPs(ipCount, outputFile)
+
+	if !silent {
+		seelog.Info("Scan finished")
+		seelog.Infof(
+			"Successful: %d  Failed: %d",
+			orchestrator.successfulCount,
+			orchestrator.failCount,
+		)
+	}
 }
